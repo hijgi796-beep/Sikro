@@ -489,4 +489,109 @@ async def cb_settings(c: CallbackQuery, lang: str):
 
 
 @user_r.callback_query(F.data.startswith("sl:"))
-async def cb_setlang
+async def cb_setlang(c: CallbackQuery):
+    code = c.data.split(":")[1]
+    if code in LANGS:
+        await db.execute("UPDATE users SET lang=$1 WHERE id=$2", code, c.from_user.id)
+        await c.answer(t(code, "lang_ok"))
+        await send_menu(c, code)
+
+
+def admin_kb():
+    return kb(
+        [("📊 الإحصائيات", "adm:stats"), ("👥 الدعوات", "adm:ref")],
+        [("💰 إضافة رصيد", "adm:bal")],
+        [("➕ مهمة: قناة", "adm:task:channel"), ("➕ مهمة: بوت", "adm:task:bot")],
+        [("🚫 حظر", "adm:ban"), ("✅ فك الحظر", "adm:unban")],
+        [("⬅️ رجوع", "menu")])
+
+
+@admin_r.callback_query(F.data == "admin")
+async def cb_admin(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(c, "🛠 <b>لوحة الأدمن</b>", admin_kb())
+    await c.answer()
+
+
+@admin_r.callback_query(F.data == "adm:stats")
+async def adm_stats(c: CallbackQuery):
+    q = lambda w: db.fetchval(f"SELECT count(*) FROM users WHERE {w}")
+    now = await q("last_active > now()-interval '5 minutes'")
+    hour = await q("last_active > now()-interval '1 hour'")
+    day = await q("last_active > now()-interval '1 day'")
+    total = await q("TRUE")
+    pending = await db.fetchval("SELECT count(*) FROM payments WHERE status='pending'")
+    await show(c, f"📊 <b>المستخدمون النشطون</b>\n\n🟢 الآن (5 د): {now}\n🕐 آخر ساعة: {hour}\n📅 آخر 24 ساعة: {day}\n👥 الإجمالي: {total}\n\n⏳ دفعات معلقة: {pending}",
+               kb([("⬅️ رجوع", "admin")]))
+    await c.answer()
+
+
+@admin_r.callback_query(F.data == "adm:ref")
+async def adm_ref(c: CallbackQuery):
+    today = await db.fetchval("SELECT count(*) FROM users WHERE referred_by IS NOT NULL AND joined >= date_trunc('day', now())")
+    total = await db.fetchval("SELECT count(*) FROM users WHERE referred_by IS NOT NULL")
+    await show(c, f"👥 <b>الدعوات</b>\n\nاليوم: {today}\nالإجمالي: {total}", kb([("⬅️ رجوع", "admin")]))
+    await c.answer()
+
+
+PROMPTS = {
+    "bal": "💰 أرسل: <code>ID المبلغ</code>\nمثال: <code>123456789 50</code> (سالب للخصم)",
+    "ban": "🚫 أرسل ID المستخدم لحظره",
+    "unban": "✅ أرسل ID المستخدم لفك الحظر",
+    "task": "➕ أرسل: <code>المعرف المكافأة العدد</code>\nمثال: <code>@mychannel 1 100</code>\n(القناة يجب أن يكون البوت أدمن فيها ليتم التحقق)",
+}
+
+
+@admin_r.callback_query(F.data.startswith("adm:") & F.data.regexp(r"^adm:(bal|ban|unban|task)"))
+async def adm_prompt(c: CallbackQuery, state: FSMContext):
+    parts = c.data.split(":")
+    await state.set_state(Adm.input)
+    await state.update_data(action=parts[1], kind=parts[2] if len(parts) > 2 else None)
+    await c.message.answer(PROMPTS[parts[1]] + "\n\n/cancel للإلغاء")
+    await c.answer()
+
+
+@admin_r.message(Adm.input, F.text, ~F.text.startswith("/"))
+async def adm_input(m: Message, state: FSMContext):
+    d = await state.get_data()
+    a, p = d["action"], m.text.split()
+    try:
+        if a == "bal":
+            uid, amt = int(p[0]), int(p[1])
+            pts = await db.fetchval("UPDATE users SET points=points+$2 WHERE id=$1 RETURNING points", uid, amt)
+            res = f"✅ الرصيد الجديد: {pts}" if pts is not None else "❌ المستخدم غير موجود"
+        elif a in ("ban", "unban"):
+            uid = int(p[0])
+            ok = await db.fetchval("UPDATE users SET banned=$2 WHERE id=$1 RETURNING id", uid, a == "ban")
+            res = ("✅ تم الحظر" if a == "ban" else "✅ تم فك الحظر") if ok else "❌ المستخدم غير موجود"
+        else:
+            target = parse_target(p[0], d["kind"])
+            if not target:
+                return await m.answer("❌ معرف غير صالح، أعد المحاولة أو /cancel")
+            reward, count = int(p[1]), int(p[2])
+            await db.execute("INSERT INTO tasks(owner,type,target,reward,total) VALUES(NULL,$1,$2,$3,$4)",
+                             d["kind"], target, reward, count)
+            res = f"✅ تمت إضافة المهمة: {target} | {reward} نقطة | {count} مرة"
+    except (ValueError, IndexError):
+        return await m.answer("❌ صيغة خاطئة، أعد المحاولة أو /cancel")
+    await state.clear()
+    await m.answer(res, reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+
+
+async def main():
+    global db, BOT_ID, BOT_USERNAME
+    logging.basicConfig(level=logging.INFO)
+    db = await asyncpg.create_pool(DATABASE_URL)
+    await db.execute(SCHEMA)
+    me = await bot.get_me()
+    BOT_ID, BOT_USERNAME = me.id, me.username
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(UserMW())
+    dp.callback_query.outer_middleware(UserMW())
+    dp.include_routers(admin_r, user_r)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
