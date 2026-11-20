@@ -28,7 +28,7 @@ TASK_REWARD = int(os.getenv("TASK_REWARD", "1"))         # points a user earns p
 COST_PER_MEMBER = int(os.getenv("COST_PER_MEMBER", "2")) # points a user pays per member
 PACKAGES = [(100, 1), (550, 5), (1200, 10), (3200, 25)]  # (points, price in USD)
 QTYS = [10, 25, 50, 100]
-BOT_WAIT_SECONDS = 8  # bot-start tasks can't be verified, so we enforce a small delay
+BOT_WAIT_SECONDS = 10  # bot-start tasks can't be verified, so we enforce a small delay
 
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML, link_preview_is_disabled=True))
 db: asyncpg.Pool = None
@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS payments(
 CREATE TABLE IF NOT EXISTS tickets(
   id SERIAL PRIMARY KEY, user_id BIGINT, text TEXT, status TEXT DEFAULT 'open',
   created TIMESTAMPTZ DEFAULT now());
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS mandatory BOOL DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS descr TEXT;
 """
 
 # ───────────────────────────────── Helpers ─────────────────────────────────
@@ -76,17 +78,44 @@ async def show(ev, text, markup=None):
 
 
 def link(target: str) -> str:
+    if target.startswith("http"):
+        return target
     return "https://t.me/" + target.lstrip("@")
 
 
+def display(target: str) -> str:
+    m = re.search(r"t\.me/([^?/]+)", target)
+    return "@" + m.group(1) if m else target
+
+
 def parse_target(text: str, kind: str):
-    m = re.match(r"^(?:https?://t\.me/|@)?([A-Za-z][A-Za-z0-9_]{4,31})$", (text or "").strip())
+    """Channel -> '@name'. Bot -> '@name' or the full referral link https://t.me/name?start=XXX"""
+    m = re.match(r"^(?:(?:https?://)?t\.me/|@)?([A-Za-z][A-Za-z0-9_]{4,31})(?:\?start=([A-Za-z0-9_=\-]+))?$",
+                 (text or "").strip())
     if not m:
         return None
-    name = m.group(1)
-    if kind == "bot" and not name.lower().endswith("bot"):
-        return None
+    name, start = m.group(1), m.group(2)
+    if kind == "bot":
+        if not name.lower().endswith("bot"):
+            return None
+        return f"https://t.me/{name}?start={start}" if start else "@" + name
     return "@" + name
+
+
+async def bot_is_admin(target: str) -> bool:
+    try:
+        mem = await bot.get_chat_member(target, BOT_ID)
+        return mem.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def is_member(target: str, uid: int) -> bool:
+    try:
+        mem = await bot.get_chat_member(target, uid)
+        return mem.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
 
 
 def menu_kb(l, uid):
@@ -119,6 +148,48 @@ async def notify_admins(text, markup=None, photo=None):
 
 
 # ─────────────────────── Middleware: register, ban, activity ───────────────────────
+async def give_referral(new_uid, arg):
+    try:
+        ref = int(arg)
+    except ValueError:
+        return
+    if ref == new_uid:
+        return
+    ok = await db.fetchval(
+        "UPDATE users SET points=points+$2, referrals=referrals+1 WHERE id=$1 RETURNING id", ref, REF_BONUS)
+    if ok:
+        await db.execute("UPDATE users SET referred_by=$1 WHERE id=$2", ref, new_uid)
+        rl = await db.fetchval("SELECT lang FROM users WHERE id=$1", ref)
+        try:
+            await bot.send_message(ref, t(rl, "ref_joined", bonus=REF_BONUS))
+        except Exception:
+            pass
+
+
+async def gate_missing(uid):
+    return await db.fetch("""SELECT * FROM tasks t WHERE active AND mandatory
+        AND NOT EXISTS(SELECT 1 FROM completions c WHERE c.task_id=t.id AND c.user_id=$1)
+        ORDER BY id""", uid)
+
+
+def instr(l, task):
+    if task["descr"]:
+        return html.escape(task["descr"])
+    return t(l, "instr_channel" if task["type"] == "channel" else "instr_bot")
+
+
+async def show_gate(ev, l, missing):
+    uid = ev.from_user.id
+    lines, rows = [], []
+    for i, tk in enumerate(missing, 1):
+        VIEWED.setdefault((uid, tk["id"]), time.time())
+        kind = t(l, "t_channel" if tk["type"] == "channel" else "t_bot")
+        lines.append(f"{i}) {kind}: {display(tk['target'])}\n{instr(l, tk)}")
+        rows.append([(f"{i}) 🔗 {display(tk['target'])}", link(tk["target"]))])
+    rows.append([(t(l, "gate_check"), "gate")])
+    await show(ev, t(l, "gate_title") + "\n\n" + "\n\n".join(lines), kb(*rows))
+
+
 class UserMW(BaseMiddleware):
     async def __call__(self, handler, event, data):
         u = data.get("event_from_user")
@@ -133,6 +204,8 @@ class UserMW(BaseMiddleware):
             await db.execute("INSERT INTO users(id,username,first_name,lang) VALUES($1,$2,$3,$4)",
                              u.id, u.username, u.first_name, lang)
             data["is_new"], data["lang"] = True, lang
+            if isinstance(event, Message) and (event.text or "").startswith("/start ref_"):
+                await give_referral(u.id, event.text.split("ref_", 1)[1].strip())
         else:
             if row["banned"] and u.id not in ADMINS:
                 if isinstance(event, CallbackQuery):
@@ -143,6 +216,13 @@ class UserMW(BaseMiddleware):
             await db.execute("UPDATE users SET last_active=now(), username=$2, first_name=$3 WHERE id=$1",
                              u.id, u.username, u.first_name)
             data["lang"] = row["lang"]
+        if u.id not in ADMINS and not (isinstance(event, CallbackQuery) and event.data == "gate"):
+            missing = await gate_missing(u.id)
+            if missing:
+                if isinstance(event, CallbackQuery):
+                    await event.answer()
+                await show_gate(event, data["lang"], missing)
+                return
         return await handler(event, data)
 
 
@@ -173,23 +253,8 @@ admin_r.callback_query.filter(F.from_user.id.in_(ADMINS))
 
 # ───────────────────────────── Start / menu / cancel ─────────────────────────────
 @user_r.message(CommandStart())
-async def start(m: Message, command: CommandObject, state: FSMContext, lang: str, is_new: bool):
+async def start(m: Message, state: FSMContext, lang: str):
     await state.clear()
-    if is_new and command.args and command.args.startswith("ref_"):
-        try:
-            ref = int(command.args[4:])
-        except ValueError:
-            ref = 0
-        if ref and ref != m.from_user.id:
-            ok = await db.fetchval(
-                "UPDATE users SET points=points+$2, referrals=referrals+1 WHERE id=$1 RETURNING id", ref, REF_BONUS)
-            if ok:
-                await db.execute("UPDATE users SET referred_by=$1 WHERE id=$2", ref, m.from_user.id)
-                rl = await db.fetchval("SELECT lang FROM users WHERE id=$1", ref)
-                try:
-                    await bot.send_message(ref, t(rl, "ref_joined", bonus=REF_BONUS))
-                except Exception:
-                    pass
     await send_menu(m, lang, "welcome")
 
 
@@ -207,10 +272,28 @@ async def cb_menu(c: CallbackQuery, state: FSMContext, lang: str):
     await c.answer()
 
 
+@user_r.callback_query(F.data == "gate")
+async def cb_gate(c: CallbackQuery, lang: str):
+    uid = c.from_user.id
+    for tk in await gate_missing(uid):
+        if tk["type"] == "channel":
+            ok = await is_member(tk["target"], uid)
+        else:
+            seen = VIEWED.setdefault((uid, tk["id"]), time.time())
+            ok = time.time() - seen >= BOT_WAIT_SECONDS
+        if ok:
+            await db.execute("INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING", tk["id"], uid)
+            await db.execute("UPDATE tasks SET done=done+1 WHERE id=$1", tk["id"])
+    if await gate_missing(uid):
+        return await c.answer(t(lang, "gate_fail"), show_alert=True)
+    await c.answer()
+    await send_menu(c, lang, "welcome")
+
+
 # ─────────────────────────── 1) Follow & earn ───────────────────────────
 async def next_task(uid, after=0):
     return await db.fetchrow("""
-        SELECT * FROM tasks t WHERE active AND done<total AND id>$2
+        SELECT * FROM tasks t WHERE active AND NOT mandatory AND done<total AND id>$2
           AND (owner IS NULL OR owner<>$1)
           AND NOT EXISTS(SELECT 1 FROM completions c WHERE c.task_id=t.id AND c.user_id=$1)
         ORDER BY id LIMIT 1""", uid, after)
@@ -225,7 +308,7 @@ async def show_task(ev, l, after=0):
         return await show(ev, t(l, "no_tasks"), kb([(t(l, "b_back"), "menu")]))
     VIEWED[(uid, row["id"])] = time.time()
     kind = t(l, "t_channel" if row["type"] == "channel" else "t_bot")
-    await show(ev, t(l, "task", kind=kind, target=row["target"], reward=row["reward"]), kb(
+    await show(ev, t(l, "task", kind=kind, target=display(row["target"]), instr=instr(l, row), reward=row["reward"]), kb(
         [(t(l, "b_open"), link(row["target"]))],
         [(t(l, "b_done"), f"done:{row['id']}"), (t(l, "b_skip"), f"skip:{row['id']}")],
         [(t(l, "b_back"), "menu")]))
@@ -312,21 +395,15 @@ async def order_target(m: Message, state: FSMContext, lang: str):
     target = parse_target(m.text, kind)
     if not target:
         return await m.answer(t(lang, "bad_target"))
-    if kind == "channel":
-        try:
-            mem = await bot.get_chat_member(target, BOT_ID)
-            ok = mem.status in ("administrator", "creator")
-        except Exception:
-            ok = False
-        if not ok:
-            return await m.answer(t(lang, "not_admin"))
+    if kind == "channel" and not await bot_is_admin(target):
+        return await m.answer(t(lang, "not_admin"))
     await state.update_data(target=target)
     await state.set_state(Order.qty)
     pts = await db.fetchval("SELECT points FROM users WHERE id=$1", m.from_user.id)
     rows = [[(f"{q} • {q * COST_PER_MEMBER}", f"gq:{q}") for q in QTYS[:2]],
             [(f"{q} • {q * COST_PER_MEMBER}", f"gq:{q}") for q in QTYS[2:]],
             [(t(lang, "b_back"), "menu")]]
-    await m.answer(t(lang, "get_qty", target=target, cost=COST_PER_MEMBER, points=pts), reply_markup=kb(*rows))
+    await m.answer(t(lang, "get_qty", target=display(target), cost=COST_PER_MEMBER, points=pts), reply_markup=kb(*rows))
 
 
 @user_r.callback_query(Order.qty, F.data.startswith("gq:"))
@@ -348,7 +425,7 @@ async def order_qty(c: CallbackQuery, state: FSMContext, lang: str):
                 "INSERT INTO tasks(owner,type,target,reward,total) VALUES($1,$2,$3,$4,$5)",
                 uid, data["kind"], data["target"], TASK_REWARD, qty)
     await state.clear()
-    await show(c, t(lang, "order_ok", target=data["target"], qty=qty, cost=cost), kb([(t(lang, "b_back"), "menu")]))
+    await show(c, t(lang, "order_ok", target=display(data["target"]), qty=qty, cost=cost), kb([(t(lang, "b_back"), "menu")]))
     await c.answer()
 
 
@@ -497,11 +574,20 @@ async def cb_setlang(c: CallbackQuery):
         await send_menu(c, code)
 
 
+# ───────────────────────────── 5) Admin panel ─────────────────────────────
+class AdmTask(StatesGroup):
+    link = State()
+    descr = State()
+    nums = State()
+
+
 def admin_kb():
     return kb(
         [("📊 الإحصائيات", "adm:stats"), ("👥 الدعوات", "adm:ref")],
         [("💰 إضافة رصيد", "adm:bal")],
         [("➕ مهمة: قناة", "adm:task:channel"), ("➕ مهمة: بوت", "adm:task:bot")],
+        [("🔒 إجباري: قناة", "adm:mand:channel"), ("🔒 إجباري: بوت", "adm:mand:bot")],
+        [("🗂 إدارة المهام", "adm:tl")],
         [("🚫 حظر", "adm:ban"), ("✅ فك الحظر", "adm:unban")],
         [("⬅️ رجوع", "menu")])
 
@@ -538,46 +624,116 @@ PROMPTS = {
     "bal": "💰 أرسل: <code>ID المبلغ</code>\nمثال: <code>123456789 50</code> (سالب للخصم)",
     "ban": "🚫 أرسل ID المستخدم لحظره",
     "unban": "✅ أرسل ID المستخدم لفك الحظر",
-    "task": "➕ أرسل: <code>المعرف المكافأة العدد</code>\nمثال: <code>@mychannel 1 100</code>\n(القناة يجب أن يكون البوت أدمن فيها ليتم التحقق)",
 }
 
 
-@admin_r.callback_query(F.data.startswith("adm:") & F.data.regexp(r"^adm:(bal|ban|unban|task)"))
+@admin_r.callback_query(F.data.regexp(r"^adm:(bal|ban|unban)$"))
 async def adm_prompt(c: CallbackQuery, state: FSMContext):
-    parts = c.data.split(":")
+    action = c.data.split(":")[1]
     await state.set_state(Adm.input)
-    await state.update_data(action=parts[1], kind=parts[2] if len(parts) > 2 else None)
-    await c.message.answer(PROMPTS[parts[1]] + "\n\n/cancel للإلغاء")
+    await state.update_data(action=action)
+    await c.message.answer(PROMPTS[action] + "\n\n/cancel للإلغاء")
     await c.answer()
 
 
 @admin_r.message(Adm.input, F.text, ~F.text.startswith("/"))
 async def adm_input(m: Message, state: FSMContext):
-    d = await state.get_data()
-    a, p = d["action"], m.text.split()
+    a, p = (await state.get_data())["action"], m.text.split()
     try:
         if a == "bal":
             uid, amt = int(p[0]), int(p[1])
             pts = await db.fetchval("UPDATE users SET points=points+$2 WHERE id=$1 RETURNING points", uid, amt)
             res = f"✅ الرصيد الجديد: {pts}" if pts is not None else "❌ المستخدم غير موجود"
-        elif a in ("ban", "unban"):
+        else:
             uid = int(p[0])
             ok = await db.fetchval("UPDATE users SET banned=$2 WHERE id=$1 RETURNING id", uid, a == "ban")
             res = ("✅ تم الحظر" if a == "ban" else "✅ تم فك الحظر") if ok else "❌ المستخدم غير موجود"
-        else:
-            target = parse_target(p[0], d["kind"])
-            if not target:
-                return await m.answer("❌ معرف غير صالح، أعد المحاولة أو /cancel")
-            reward, count = int(p[1]), int(p[2])
-            await db.execute("INSERT INTO tasks(owner,type,target,reward,total) VALUES(NULL,$1,$2,$3,$4)",
-                             d["kind"], target, reward, count)
-            res = f"✅ تمت إضافة المهمة: {target} | {reward} نقطة | {count} مرة"
     except (ValueError, IndexError):
         return await m.answer("❌ صيغة خاطئة، أعد المحاولة أو /cancel")
     await state.clear()
     await m.answer(res, reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
 
 
+# ── Add task (normal or mandatory): link → campaign name → reward/count ──
+@admin_r.callback_query(F.data.regexp(r"^adm:(task|mand):(channel|bot)$"))
+async def adm_task_start(c: CallbackQuery, state: FSMContext):
+    _, mode, kind = c.data.split(":")
+    await state.set_state(AdmTask.link)
+    await state.update_data(mode=mode, kind=kind)
+    if kind == "bot":
+        txt = "🔗 أرسل رابط الإحالة الخاص بالبوت\nمثال: <code>https://t.me/mybot?start=123456</code>"
+    else:
+        txt = "📢 أرسل معرف القناة\nمثال: <code>@mychannel</code>\n(لازم يكون البوت أدمن فيها ليتحقق من الاشتراك)"
+    if mode == "mand":
+        txt = "🔒 <b>مهمة إجبارية</b> (كل مستخدم لازم يكملها ليستعمل البوت)\n\n" + txt
+    await c.message.answer(txt + "\n\n/cancel للإلغاء")
+    await c.answer()
+
+
+@admin_r.message(AdmTask.link, F.text, ~F.text.startswith("/"))
+async def adm_task_link(m: Message, state: FSMContext):
+    d = await state.get_data()
+    target = parse_target(m.text, d["kind"])
+    if not target:
+        return await m.answer("❌ رابط/معرف غير صالح، أعد المحاولة أو /cancel")
+    if d["kind"] == "channel" and not await bot_is_admin(target):
+        return await m.answer("❌ أضف البوت أدمن في القناة أولاً ثم أرسل المعرف مرة أخرى")
+    await state.update_data(target=target)
+    await state.set_state(AdmTask.descr)
+    await m.answer("📝 أرسل اسم الحملة أو وصفها (يظهر للمستخدم)\nمثال: <code>إرسال /start للبوت والبقاء فيه 10 ثواني</code>")
+
+
+@admin_r.message(AdmTask.descr, F.text, ~F.text.startswith("/"))
+async def adm_task_descr(m: Message, state: FSMContext):
+    d = await state.get_data()
+    descr = m.text.strip()[:300]
+    if d["mode"] == "mand":
+        await db.execute(
+            "INSERT INTO tasks(owner,type,target,reward,total,descr,mandatory) VALUES(NULL,$1,$2,0,1000000000,$3,TRUE)",
+            d["kind"], d["target"], descr)
+        await state.clear()
+        return await m.answer(f"✅ تمت إضافة مهمة إجبارية: {display(d['target'])}\nكل المستخدمين (القدامى والجدد) لازم يكملونها.",
+                              reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+    await state.update_data(descr=descr)
+    await state.set_state(AdmTask.nums)
+    await m.answer("🎁 أرسل: <code>المكافأة العدد</code>\nمثال: <code>1 100</code>\n(المكافأة بالنقاط لكل مستخدم، والعدد = كم مستخدم يقدر ينفذها)")
+
+
+@admin_r.message(AdmTask.nums, F.text, ~F.text.startswith("/"))
+async def adm_task_nums(m: Message, state: FSMContext):
+    d = await state.get_data()
+    try:
+        reward, count = (int(x) for x in m.text.split()[:2])
+        assert reward >= 0 and count > 0
+    except (ValueError, AssertionError):
+        return await m.answer("❌ صيغة خاطئة، مثال: <code>1 100</code>")
+    await db.execute(
+        "INSERT INTO tasks(owner,type,target,reward,total,descr,mandatory) VALUES(NULL,$1,$2,$3,$4,$5,FALSE)",
+        d["kind"], d["target"], reward, count, d["descr"])
+    await state.clear()
+    await m.answer(f"✅ تمت إضافة المهمة: {display(d['target'])} | {reward} نقطة | {count} مرة",
+                   reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+
+
+# ── Manage tasks ──
+@admin_r.callback_query(F.data.regexp(r"^adm:(tl|td:\d+)$"))
+async def adm_tasks(c: CallbackQuery):
+    parts = c.data.split(":")
+    if parts[1] == "td":
+        await db.execute("UPDATE tasks SET active=FALSE WHERE id=$1 AND owner IS NULL", int(parts[2]))
+    rows = await db.fetch("SELECT * FROM tasks WHERE active AND owner IS NULL ORDER BY id DESC LIMIT 20")
+    if not rows:
+        await show(c, "🗂 لا توجد مهام فعالة", kb([("⬅️ رجوع", "admin")]))
+        return await c.answer()
+    lines = [f"#{r['id']} {'🔒' if r['mandatory'] else '🎯'} {r['type']} {display(r['target'])} — "
+             f"{r['done']}/{'∞' if r['mandatory'] else r['total']}" for r in rows]
+    btns = [(f"🗑 #{r['id']}", f"adm:td:{r['id']}") for r in rows]
+    grid = [btns[i:i + 3] for i in range(0, len(btns), 3)] + [[("⬅️ رجوع", "admin")]]
+    await show(c, "🗂 <b>المهام الفعالة</b> (🔒 إجباري / 🎯 عادي)\n\n" + "\n".join(lines), kb(*grid))
+    await c.answer()
+
+
+# ───────────────────────────────── Run ─────────────────────────────────
 async def main():
     global db, BOT_ID, BOT_USERNAME
     logging.basicConfig(level=logging.INFO)
