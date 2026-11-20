@@ -211,6 +211,57 @@ STR = {
 }
 
 
+EXTRA = {
+    "en": {
+        "task": "{kind}: {target}\n\n{instr}\n\n🎁 Reward: <b>{reward}</b> points",
+        "instr_channel": "1) Tap Open and join the channel.\n2) Come back and tap Done.",
+        "instr_bot": "1) Tap Open and press Start.\n2) Stay in the bot for 10 seconds, then come back and tap Done.",
+        "gate_title": "🔒 Complete these required steps to use the bot:",
+        "gate_check": "✅ I've completed them",
+        "gate_fail": "❌ You haven't completed all the steps yet.",
+        "get_bot": "Send your bot's referral link (e.g. https://t.me/my_bot?start=123456) or its username.\n\n/cancel to abort.",
+    },
+    "ar": {
+        "task": "{kind}: {target}\n\n{instr}\n\n🎁 المكافأة: <b>{reward}</b> نقطة",
+        "instr_channel": "1) اضغط فتح ثم اشترك في القناة.\n2) ارجع واضغط تم.",
+        "instr_bot": "1) اضغط فتح ثم اضغط Start.\n2) ابقَ في البوت 10 ثواني، ثم ارجع واضغط تم.",
+        "gate_title": "🔒 أكمل هذه الخطوات الإجبارية لتستخدم البوت:",
+        "gate_check": "✅ أكملتها",
+        "gate_fail": "❌ لم تكمل كل الخطوات بعد.",
+        "get_bot": "أرسل رابط الإحالة الخاص ببوتك (مثال: https://t.me/my_bot?start=123456) أو معرفه.\n\n/cancel للإلغاء.",
+    },
+    "ru": {
+        "task": "{kind}: {target}\n\n{instr}\n\n🎁 Награда: <b>{reward}</b> баллов",
+        "instr_channel": "1) Нажмите «Открыть» и подпишитесь на канал.\n2) Вернитесь и нажмите «Готово».",
+        "instr_bot": "1) Нажмите «Открыть» и нажмите Start.\n2) Побудьте в боте 10 секунд, затем вернитесь и нажмите «Готово».",
+        "gate_title": "🔒 Выполните эти обязательные шаги, чтобы пользоваться ботом:",
+        "gate_check": "✅ Я выполнил(а)",
+        "gate_fail": "❌ Вы выполнили не все шаги.",
+        "get_bot": "Отправьте реферальную ссылку вашего бота (например, https://t.me/my_bot?start=123456) или его username.\n\n/cancel — отмена.",
+    },
+    "fr": {
+        "task": "{kind} : {target}\n\n{instr}\n\n🎁 Récompense : <b>{reward}</b> points",
+        "instr_channel": "1) Appuyez sur Ouvrir et rejoignez la chaîne.\n2) Revenez et appuyez sur Fait.",
+        "instr_bot": "1) Appuyez sur Ouvrir puis sur Start.\n2) Restez dans le bot 10 secondes, puis revenez et appuyez sur Fait.",
+        "gate_title": "🔒 Complétez ces étapes obligatoires pour utiliser le bot :",
+        "gate_check": "✅ C'est fait",
+        "gate_fail": "❌ Vous n'avez pas terminé toutes les étapes.",
+        "get_bot": "Envoyez le lien de parrainage de votre bot (ex. https://t.me/my_bot?start=123456) ou son nom d'utilisateur.\n\n/cancel pour annuler.",
+    },
+    "es": {
+        "task": "{kind}: {target}\n\n{instr}\n\n🎁 Recompensa: <b>{reward}</b> puntos",
+        "instr_channel": "1) Pulsa Abrir y únete al canal.\n2) Vuelve y pulsa Hecho.",
+        "instr_bot": "1) Pulsa Abrir y luego Start.\n2) Quédate en el bot 10 segundos, luego vuelve y pulsa Hecho.",
+        "gate_title": "🔒 Completa estos pasos obligatorios para usar el bot:",
+        "gate_check": "✅ Ya los completé",
+        "gate_fail": "❌ Aún no completaste todos los pasos.",
+        "get_bot": "Envía el enlace de referido de tu bot (ej. https://t.me/my_bot?start=123456) o su usuario.\n\n/cancel para cancelar.",
+    },
+}
+for _l, _d in EXTRA.items():
+    STR[_l].update(_d)
+
+
 def t(lang: str, key: str, **kw) -> str:
     s = STR.get(lang, {}).get(key) or STR["en"][key]
     return s.format(**kw)
