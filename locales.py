@@ -302,6 +302,15 @@ EXTRA = {
         "insufficient_pts": "❌ Necesitas {need} puntos, tienes {points}.",
     },
 }
+EXTRA["en"].update({
+    "left_penalty": "⚠️ You left {target}. {n} points were deducted.",
+    "miss_you": "👋 We miss you! New tasks, a daily bonus and the lucky wheel are waiting in the bot.",
+})
+EXTRA["ar"].update({
+    "left_penalty": "⚠️ لاحظنا أنك غادرت {target}. تم خصم {n} نقطة.",
+    "miss_you": "👋 اشتقنا لك! مهام جديدة ومكافأة يومية وعجلة الحظ بانتظارك في البوت.",
+})
+
 for _l, _d in EXTRA.items():
     STR[_l].update(_d)
 
