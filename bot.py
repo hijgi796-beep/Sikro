@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import time
+from collections import defaultdict
 
 import asyncpg
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -35,6 +36,7 @@ db: asyncpg.Pool = None
 BOT_ID = 0
 BOT_USERNAME = ""
 VIEWED: dict = {}
+LOCKS = defaultdict(asyncio.Lock)  # one lock per user: serializes taps so double-clicks can't double-credit/charge
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tickets(
   created TIMESTAMPTZ DEFAULT now());
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS mandatory BOOL DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS descr TEXT;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS cost INT;
 """
 
 # ───────────────────────────────── Helpers ─────────────────────────────────
@@ -123,7 +126,7 @@ def menu_kb(l, uid):
         [(t(l, "b_follow"), "follow"), (t(l, "b_get"), "get")],
         [(t(l, "b_buy"), "buy"), (t(l, "b_invite"), "invite")],
         [(t(l, "b_account"), "account"), (t(l, "b_support"), "support")],
-        [(t(l, "b_settings"), "settings")],
+        [(t(l, "b_orders"), "orders"), (t(l, "b_settings"), "settings")],
     ]
     if uid in ADMINS:
         rows.append([(t(l, "b_admin"), "admin")])
@@ -295,7 +298,8 @@ async def next_task(uid, after=0):
     return await db.fetchrow("""
         SELECT * FROM tasks t WHERE active AND NOT mandatory AND done<total AND id>$2
           AND (owner IS NULL OR owner<>$1)
-          AND NOT EXISTS(SELECT 1 FROM completions c WHERE c.task_id=t.id AND c.user_id=$1)
+          AND NOT EXISTS(SELECT 1 FROM completions c JOIN tasks t2 ON t2.id=c.task_id
+                         WHERE c.user_id=$1 AND lower(t2.target)=lower(t.target))
         ORDER BY id LIMIT 1""", uid, after)
 
 
@@ -330,44 +334,58 @@ class Full(Exception):
     pass
 
 
+class Already(Exception):
+    pass
+
+
 @user_r.callback_query(F.data.startswith("done:"))
 async def cb_done(c: CallbackQuery, lang: str):
     uid, tid = c.from_user.id, int(c.data.split(":")[1])
-    task = await db.fetchrow("SELECT * FROM tasks WHERE id=$1", tid)
-    if not task or not task["active"]:
-        await c.answer(t(lang, "task_full"), show_alert=True)
-        return await show_task(c, lang)
-    if task["type"] == "channel":
-        try:
-            mem = await bot.get_chat_member(task["target"], uid)
-            ok = mem.status in ("member", "administrator", "creator")
-        except Exception:
-            ok = False
-        if not ok:
-            return await c.answer(t(lang, "not_joined"), show_alert=True)
-    elif time.time() - VIEWED.get((uid, tid), 0) < BOT_WAIT_SECONDS:
-        return await c.answer(t(lang, "wait"), show_alert=True)
+    async with LOCKS[uid]:  # taps are processed one at a time per user
+        task = await db.fetchrow("SELECT * FROM tasks WHERE id=$1", tid)
+        if not task or not task["active"] or task["mandatory"]:
+            await c.answer(t(lang, "task_full"), show_alert=True)
+            return await show_task(c, lang)
+        if task["owner"] == uid:  # can't earn from your own order
+            await c.answer()
+            return await show_task(c, lang)
+        if task["type"] == "channel":
+            try:
+                mem = await bot.get_chat_member(task["target"], uid)
+                ok = mem.status in ("member", "administrator", "creator")
+            except Exception:
+                ok = False
+            if not ok:
+                return await c.answer(t(lang, "not_joined"), show_alert=True)
+        elif time.time() - VIEWED.get((uid, tid), 0) < BOT_WAIT_SECONDS:
+            return await c.answer(t(lang, "wait"), show_alert=True)
 
-    try:
-        async with db.acquire() as con:
-            async with con.transaction():
-                ins = await con.fetchval(
-                    "INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", tid, uid)
-                if not ins:
-                    await c.answer(t(lang, "already"), show_alert=True)
-                    return await show_task(c, lang)
-                upd = await con.fetchval(
-                    "UPDATE tasks SET done=done+1, active=(done+1<total) WHERE id=$1 AND done<total RETURNING id", tid)
-                if not upd:
-                    raise Full()
-                pts = await con.fetchval(
-                    "UPDATE users SET points=points+$2, tasks_done=tasks_done+1 WHERE id=$1 RETURNING points",
-                    uid, task["reward"])
-    except Full:
-        await c.answer(t(lang, "task_full"), show_alert=True)
-        return await show_task(c, lang)
-    await c.answer(t(lang, "done_ok", n=task["reward"], points=pts))
-    await show_task(c, lang)
+        try:
+            async with db.acquire() as con:
+                async with con.transaction():
+                    # same channel/bot can only pay a user once, even if it appears in several tasks
+                    dup = await con.fetchval(
+                        """SELECT 1 FROM completions c JOIN tasks t2 ON t2.id=c.task_id
+                           WHERE c.user_id=$1 AND lower(t2.target)=lower($2) LIMIT 1""", uid, task["target"])
+                    if dup:
+                        raise Already()
+                    await con.execute("INSERT INTO completions VALUES($1,$2)", tid, uid)
+                    upd = await con.fetchval(
+                        "UPDATE tasks SET done=done+1, active=(done+1<total) "
+                        "WHERE id=$1 AND active AND done<total RETURNING id", tid)
+                    if not upd:
+                        raise Full()
+                    pts = await con.fetchval(
+                        "UPDATE users SET points=points+$2, tasks_done=tasks_done+1 WHERE id=$1 RETURNING points",
+                        uid, task["reward"])
+        except Already:
+            await c.answer(t(lang, "already"), show_alert=True)
+            return await show_task(c, lang)
+        except Full:
+            await c.answer(t(lang, "task_full"), show_alert=True)
+            return await show_task(c, lang)
+        await c.answer(t(lang, "done_ok", n=task["reward"], points=pts))
+        await show_task(c, lang)
 
 
 # ─────────────────────────── 2) Get followers ───────────────────────────
@@ -411,21 +429,88 @@ async def order_qty(c: CallbackQuery, state: FSMContext, lang: str):
     qty = int(c.data.split(":")[1])
     if qty not in QTYS:
         return await c.answer()
-    data = await state.get_data()
     cost = qty * COST_PER_MEMBER
     uid = c.from_user.id
+    async with LOCKS[uid]:
+        data = await state.get_data()
+        if "target" not in data:  # order already processed by a previous tap
+            return await c.answer()
+        async with db.acquire() as con:
+            async with con.transaction():
+                left = await con.fetchval(
+                    "UPDATE users SET points=points-$1 WHERE id=$2 AND points>=$1 RETURNING points", cost, uid)
+                if left is None:
+                    pts = await con.fetchval("SELECT points FROM users WHERE id=$1", uid)
+                    return await c.answer(t(lang, "no_points", need=cost, points=pts), show_alert=True)
+                await con.execute(
+                    "INSERT INTO tasks(owner,type,target,reward,total,cost) VALUES($1,$2,$3,$4,$5,$6)",
+                    uid, data["kind"], data["target"], TASK_REWARD, qty, COST_PER_MEMBER)
+        await state.clear()
+    await show(c, t(lang, "order_ok", target=display(data["target"]), qty=qty, cost=cost),
+               kb([(t(lang, "b_orders"), "orders")], [(t(lang, "b_back"), "menu")]))
+    await c.answer()
+
+
+# ─────────────── My orders: list + cancel with refund of the unspent part ───────────────
+def refund_of(row) -> int:
+    per = row["cost"] if row["cost"] is not None else COST_PER_MEMBER
+    return (row["total"] - row["done"]) * per
+
+
+async def show_orders(ev, l):
+    rows = await db.fetch(
+        "SELECT * FROM tasks WHERE owner=$1 AND active AND done<total ORDER BY id DESC LIMIT 20", ev.from_user.id)
+    if not rows:
+        return await show(ev, t(l, "orders_none"), kb([(t(l, "b_back"), "menu")]))
+    lines = []
+    for r in rows:
+        kind = t(l, "t_channel" if r["type"] == "channel" else "t_bot")
+        lines.append(f"#{r['id']} {kind} {display(r['target'])} — {r['done']}/{r['total']}")
+    btns = [(f"🗑 #{r['id']}", f"tc:{r['id']}") for r in rows]
+    grid = [btns[i:i + 3] for i in range(0, len(btns), 3)] + [[(t(l, "b_back"), "menu")]]
+    await show(ev, t(l, "orders_title") + "\n\n" + "\n".join(lines), kb(*grid))
+
+
+@user_r.callback_query(F.data == "orders")
+async def cb_orders(c: CallbackQuery, lang: str, state: FSMContext):
+    await state.clear()
+    await show_orders(c, lang)
+    await c.answer()
+
+
+@user_r.callback_query(F.data.startswith("tc:"))
+async def cb_cancel_ask(c: CallbackQuery, lang: str):
+    tid = int(c.data.split(":")[1])
+    row = await db.fetchrow(
+        "SELECT * FROM tasks WHERE id=$1 AND owner=$2 AND active AND done<total", tid, c.from_user.id)
+    if not row:
+        await c.answer(t(lang, "cancel_fail"), show_alert=True)
+        return await show_orders(c, lang)
+    await show(c, t(lang, "cancel_confirm", id=tid, target=display(row["target"]), done=row["done"],
+                    total=row["total"], refund=refund_of(row)),
+               kb([(t(lang, "b_confirm_cancel"), f"tcy:{tid}")], [(t(lang, "b_back"), "orders")]))
+    await c.answer()
+
+
+@user_r.callback_query(F.data.startswith("tcy:"))
+async def cb_cancel_do(c: CallbackQuery, lang: str):
+    tid, uid = int(c.data.split(":")[1]), c.from_user.id
+    row = pts = None
     async with db.acquire() as con:
         async with con.transaction():
-            left = await con.fetchval(
-                "UPDATE users SET points=points-$1 WHERE id=$2 AND points>=$1 RETURNING points", cost, uid)
-            if left is None:
-                pts = await con.fetchval("SELECT points FROM users WHERE id=$1", uid)
-                return await c.answer(t(lang, "no_points", need=cost, points=pts), show_alert=True)
-            await con.execute(
-                "INSERT INTO tasks(owner,type,target,reward,total) VALUES($1,$2,$3,$4,$5)",
-                uid, data["kind"], data["target"], TASK_REWARD, qty)
-    await state.clear()
-    await show(c, t(lang, "order_ok", target=display(data["target"]), qty=qty, cost=cost), kb([(t(lang, "b_back"), "menu")]))
+            # the UPDATE locks the row: a concurrent "Done" either finished before (and is counted) or is rejected
+            row = await con.fetchrow(
+                "UPDATE tasks SET active=FALSE WHERE id=$1 AND owner=$2 AND active AND done<total "
+                "RETURNING total, done, cost", tid, uid)
+            if row:
+                refund = refund_of(row)
+                pts = await con.fetchval(
+                    "UPDATE users SET points=points+$2 WHERE id=$1 RETURNING points", uid, refund)
+    if not row:
+        await c.answer(t(lang, "cancel_fail"), show_alert=True)
+        return await show_orders(c, lang)
+    await show(c, t(lang, "cancel_ok", refund=refund, points=pts),
+               kb([(t(lang, "b_orders"), "orders")], [(t(lang, "b_back"), "menu")]))
     await c.answer()
 
 
@@ -578,7 +663,8 @@ async def cb_setlang(c: CallbackQuery):
 class AdmTask(StatesGroup):
     link = State()
     descr = State()
-    nums = State()
+    count = State()
+    reward = State()
 
 
 def admin_kb():
@@ -695,23 +781,39 @@ async def adm_task_descr(m: Message, state: FSMContext):
         return await m.answer(f"✅ تمت إضافة مهمة إجبارية: {display(d['target'])}\nكل المستخدمين (القدامى والجدد) لازم يكملونها.",
                               reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
     await state.update_data(descr=descr)
-    await state.set_state(AdmTask.nums)
-    await m.answer("🎁 أرسل: <code>المكافأة العدد</code>\nمثال: <code>1 100</code>\n(المكافأة بالنقاط لكل مستخدم، والعدد = كم مستخدم يقدر ينفذها)")
+    await state.set_state(AdmTask.count)
+    await m.answer("🔢 كم عدد المهام؟ (كم مستخدم يقدر ينفذها)\nمثال: <code>100</code>")
 
 
-@admin_r.message(AdmTask.nums, F.text, ~F.text.startswith("/"))
-async def adm_task_nums(m: Message, state: FSMContext):
+@admin_r.message(AdmTask.count, F.text, ~F.text.startswith("/"))
+async def adm_task_count(m: Message, state: FSMContext):
+    try:
+        count = int(m.text.strip())
+    except ValueError:
+        count = 0
+    if count <= 0:
+        return await m.answer("❌ أرسل رقماً صحيحاً أكبر من 0، مثال: <code>100</code>")
+    await state.update_data(count=count)
+    await state.set_state(AdmTask.reward)
+    await m.answer(f"🎁 كم نقطة (الثمن) يأخذها كل مستخدم عن المهمة الواحدة؟\nمثال: <code>1</code>\n\n🔢 العدد: {count}")
+
+
+@admin_r.message(AdmTask.reward, F.text, ~F.text.startswith("/"))
+async def adm_task_reward(m: Message, state: FSMContext):
     d = await state.get_data()
     try:
-        reward, count = (int(x) for x in m.text.split()[:2])
-        assert reward >= 0 and count > 0
-    except (ValueError, AssertionError):
-        return await m.answer("❌ صيغة خاطئة، مثال: <code>1 100</code>")
+        reward = int(m.text.strip())
+    except ValueError:
+        reward = -1
+    if reward < 0:
+        return await m.answer("❌ أرسل رقماً صحيحاً (0 أو أكثر)، مثال: <code>1</code>")
+    count = d["count"]
     await db.execute(
         "INSERT INTO tasks(owner,type,target,reward,total,descr,mandatory) VALUES(NULL,$1,$2,$3,$4,$5,FALSE)",
         d["kind"], d["target"], reward, count, d["descr"])
     await state.clear()
-    await m.answer(f"✅ تمت إضافة المهمة: {display(d['target'])} | {reward} نقطة | {count} مرة",
+    await m.answer(f"✅ تمت إضافة المهمة: {display(d['target'])}\n🔢 العدد: {count}\n🎁 الثمن: {reward} نقطة لكل مستخدم\n"
+                   f"💰 الإجمالي الذي سيُوزَّع: {reward * count} نقطة",
                    reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
 
 
