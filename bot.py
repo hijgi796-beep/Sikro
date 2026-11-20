@@ -1,4 +1,6 @@
 import asyncio
+import random
+import sys
 import html
 import logging
 import os
@@ -16,7 +18,7 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, Message, WebAppInfo
 
 from locales import LANGS, t
 
@@ -30,6 +32,17 @@ TASK_REWARD = int(os.getenv("TASK_REWARD", "1"))
 COST_PER_MEMBER = int(os.getenv("COST_PER_MEMBER", "2"))
 WELCOME_BONUS = int(os.getenv("WELCOME_BONUS", "5")) # مكافأة الترحيب
 DAILY_BASE = int(os.getenv("DAILY_BASE", "3"))       # مكافأة اليومية الأساسية
+DAILY_STEP = int(os.getenv("DAILY_STEP", "1"))         # زيادة المكافأة لكل يوم متتالي
+DAILY_MAX_STREAK = int(os.getenv("DAILY_MAX_STREAK", "7"))  # سقف الأيام المتتالية
+AD_INTERVAL = int(os.getenv("AD_INTERVAL", "600"))     # ثواني بين كل إعلان وآخر (الإعلان يظهر بعد هذه المدة)
+AD_WATCH_SECONDS = int(os.getenv("AD_WATCH_SECONDS", "15"))  # مدة المشاهدة المطلوبة
+AD_DAILY_LIMIT = int(os.getenv("AD_DAILY_LIMIT", "20"))      # أقصى عدد إعلانات يومياً للمستخدم
+AD_DEFAULT_REWARD = int(os.getenv("AD_DEFAULT_REWARD", "2"))
+MAX_ORDER = int(os.getenv("MAX_ORDER", "100000"))
+# عجلة الحظ: (الجائزة بالنقاط, الوزن)
+WHEEL = [(0, 22), (1, 24), (2, 20), (3, 12), (5, 9), (10, 7), (20, 4), (50, 2)]
+# المستويات: (الحد الأدنى من XP, الأيقونة, الاسم, نسبة بونص اليومية %)
+LEVELS = [(0, "🥉", "Bronze", 0), (100, "🥈", "Silver", 10), (400, "🥇", "Gold", 25), (1000, "💎", "Diamond", 50)]
 PACKAGES = [(100, 1), (550, 5), (1200, 10), (3200, 25)]
 BOT_WAIT_SECONDS = 10
 
@@ -41,6 +54,7 @@ db: asyncpg.Pool = None
 BOT_ID = 0
 BOT_USERNAME = ""
 VIEWED: dict = {}
+BG: list = []
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
@@ -62,12 +76,25 @@ CREATE TABLE IF NOT EXISTS tickets(
   created TIMESTAMPTZ DEFAULT now());
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS mandatory BOOL DEFAULT FALSE;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS descr TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_spin TIMESTAMPTZ;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS spins INT DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS ads_watched INT DEFAULT 0;
+CREATE TABLE IF NOT EXISTS ads(
+  id SERIAL PRIMARY KEY, title TEXT, url TEXT, reward INT DEFAULT 2,
+  active BOOL DEFAULT TRUE, views INT DEFAULT 0, created TIMESTAMPTZ DEFAULT now());
+CREATE TABLE IF NOT EXISTS ad_views(
+  id SERIAL PRIMARY KEY, user_id BIGINT, ad_id INT, started TIMESTAMPTZ DEFAULT now(),
+  claimed BOOL DEFAULT FALSE);
+CREATE INDEX IF NOT EXISTS ad_views_user ON ad_views(user_id, started);
+CREATE INDEX IF NOT EXISTS users_ref ON users(referred_by);
 """
 
 # ───────────────────────────────── Helpers ─────────────────────────────────
 def kb(*rows):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=a, **({"url": b} if b.startswith("http") else {"callback_data": b}))
+        [InlineKeyboardButton(text=a, **(
+            {"web_app": WebAppInfo(url=b[7:])} if b.startswith("webapp:")
+            else {"url": b} if b.startswith("http") else {"callback_data": b}))
          for a, b in row] for row in rows])
 
 async def show(ev, text, markup=None):
@@ -103,11 +130,16 @@ async def bot_is_admin(target: str) -> bool:
         return mem.status in ("administrator", "creator")
     except Exception: return False
 
-async def is_member(target: str, uid: int) -> bool:
+async def member_state(target: str, uid: int):
+    """True/False، أو None إذا تعذر التحقق (البوت ليس أدمن، خطأ شبكة...)."""
     try:
         mem = await bot.get_chat_member(target, uid)
+        if mem.status == "restricted": return bool(getattr(mem, "is_member", False))
         return mem.status in ("member", "administrator", "creator")
-    except Exception: return False
+    except Exception: return None
+
+async def is_member(target: str, uid: int) -> bool:
+    return (await member_state(target, uid)) is True
 
 def menu_kb(l, uid):
     rows = [
@@ -118,7 +150,8 @@ def menu_kb(l, uid):
         [(t(l, "b_settings"), "settings")],
     ]
     # إضافة زر الميني أب
-    rows.insert(0, [("🚀 Open Mini App", WEBAPP_URL)]) 
+    if WEBAPP_URL.startswith("https://"):
+        rows.insert(0, [("🚀 Mini App", "webapp:" + WEBAPP_URL)])
     if uid in ADMINS:
         rows.append([(t(l, "b_admin"), "admin")])
     return kb(*rows)
@@ -140,7 +173,7 @@ async def give_referral(new_uid, arg):
     try: ref = int(arg)
     except ValueError: return
     if ref == new_uid: return
-    ok = await db.fetchval("UPDATE users SET points=points+$2, referrals=referrals+1 WHERE id=$1 RETURNING id", ref, REF_BONUS)
+    ok = await db.fetchval("UPDATE users SET points=points+$2, referrals=referrals+1, spins=spins+1 WHERE id=$1 RETURNING id", ref, REF_BONUS)
     if ok:
         await db.execute("UPDATE users SET referred_by=$1 WHERE id=$2", ref, new_uid)
         rl = await db.fetchval("SELECT lang FROM users WHERE id=$1", ref)
@@ -239,54 +272,41 @@ async def cb_menu(c: CallbackQuery, state: FSMContext, lang: str):
     await send_menu(c, lang)
     await c.answer()
 
-@user_r.callback_query(F.data == "gate")
-async def cb_gate(c: CallbackQuery, lang: str):
-    uid = c.from_user.id
+async def gate_verify(uid):
     for tk in await gate_missing(uid):
         if tk["type"] == "channel": ok = await is_member(tk["target"], uid)
         else:
             seen = VIEWED.setdefault((uid, tk["id"]), time.time())
             ok = time.time() - seen >= BOT_WAIT_SECONDS
         if ok:
-            await db.execute("INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING", tk["id"], uid)
-            await db.execute("UPDATE tasks SET done=done+1 WHERE id=$1", tk["id"])
-    if await gate_missing(uid): return await c.answer(t(lang, "gate_fail"), show_alert=True)
+            ins = await db.fetchval("INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", tk["id"], uid)
+            if ins: await db.execute("UPDATE tasks SET done=done+1 WHERE id=$1", tk["id"])
+    return await gate_missing(uid)
+
+@user_r.callback_query(F.data == "gate")
+async def cb_gate(c: CallbackQuery, lang: str):
+    if await gate_verify(c.from_user.id): return await c.answer(t(lang, "gate_fail"), show_alert=True)
     await c.answer()
     await send_menu(c, lang, "welcome")
 
-# ─────────────────────────── المكافأة اليومية (Streak) ───────────────────────────
+# ─────────────────────────── المكافأة اليومية / لوحة الصدارة ───────────────────────────
+def fmt_wait(sec: int) -> str:
+    h, m = sec // 3600, (sec % 3600) // 60
+    return f"{h}h {m}m"
+
 @user_r.callback_query(F.data == "daily")
 async def cb_daily(c: CallbackQuery, lang: str):
-    uid = c.from_user.id
-    u = await db.fetchrow("SELECT last_daily, streak FROM users WHERE id=$1", uid)
-    now = datetime.datetime.now(datetime.timezone.utc)
-    
-    if u["last_daily"] and (now - u["last_daily"]).total_seconds() < 86400:
-        return await c.answer(t(lang, "daily_wait"), show_alert=True)
-        
-    streak = u["streak"] or 0
-    if u["last_daily"] and (now - u["last_daily"]).total_seconds() < 172800: # خلال 48 ساعة
-        streak += 1
-    else:
-        streak = 1
-        
-    reward = DAILY_BASE * streak
-    await db.execute("UPDATE users SET points=points+$1, last_daily=$2, streak=$3 WHERE id=$4", reward, now, streak, uid)
-    await c.answer(t(lang, "daily_ok", n=reward, streak=streak), show_alert=True)
+    r = await claim_daily(c.from_user.id)
+    if not r["ok"]:
+        return await c.answer(t(lang, "daily_wait") + f"\n⏳ {fmt_wait(r['wait'])}", show_alert=True)
+    await c.answer(t(lang, "daily_ok", n=r["reward"], streak=r["streak"]), show_alert=True)
     await send_menu(c, lang)
 
-# ─────────────────────────── لوحة الصدارة ───────────────────────────
 @user_r.callback_query(F.data == "leaderboard")
 async def cb_leaderboard(c: CallbackQuery, lang: str):
-    # جلب أكثر 10 أشخاص دعوا أصدقاء هذا الأسبوع
-    rows = await db.fetch("""
-        SELECT username, first_name, referrals FROM users 
-        WHERE referred_by IS NOT NULL AND joined >= date_trunc('week', now())
-        GROUP BY id ORDER BY referrals DESC LIMIT 10""")
-    if not rows:
-        txt = "لا يوجد متنافسون بعد هذا الأسبوع. كن الأول!"
-    else:
-        txt = "\n".join([f"{i+1}. {r['first_name'] or r['username'] or 'User'} - {r['referrals']} دعوة" for i, r in enumerate(rows)])
+    rows = await weekly_top(10)
+    if not rows: txt = "—"
+    else: txt = "\n".join(f"{i+1}. {html.escape(r['name'] or 'User')} — {r['n']} 👥" for i, r in enumerate(rows))
     await show(c, t(lang, "leaderboard", list=txt), kb([(t(lang, "b_back"), "menu")]))
     await c.answer()
 
@@ -321,35 +341,17 @@ async def cb_skip(c: CallbackQuery, lang: str):
     await show_task(c, lang, int(c.data.split(":")[1]))
     await c.answer()
 
-class Full(Exception): pass
-
 @user_r.callback_query(F.data.startswith("done:"))
 async def cb_done(c: CallbackQuery, lang: str):
     uid, tid = c.from_user.id, int(c.data.split(":")[1])
-    task = await db.fetchrow("SELECT * FROM tasks WHERE id=$1", tid)
-    if not task or not task["active"]:
-        await c.answer(t(lang, "task_full"), show_alert=True)
+    r = await complete_task(uid, tid)
+    code = r["code"]
+    if code == "not_joined": return await c.answer(t(lang, "not_joined"), show_alert=True)
+    if code == "wait": return await c.answer(t(lang, "wait"), show_alert=True)
+    if code in ("gone", "full", "already"):
+        await c.answer(t(lang, "already" if code == "already" else "task_full"), show_alert=True)
         return await show_task(c, lang)
-    if task["type"] == "channel":
-        ok = await is_member(task["target"], uid)
-        if not ok: return await c.answer(t(lang, "not_joined"), show_alert=True)
-    elif time.time() - VIEWED.get((uid, tid), 0) < BOT_WAIT_SECONDS:
-        return await c.answer(t(lang, "wait"), show_alert=True)
-
-    try:
-        async with db.acquire() as con:
-            async with con.transaction():
-                ins = await con.fetchval("INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", tid, uid)
-                if not ins:
-                    await c.answer(t(lang, "already"), show_alert=True)
-                    return await show_task(c, lang)
-                upd = await con.fetchval("UPDATE tasks SET done=done+1, active=(done+1<total) WHERE id=$1 AND done<total RETURNING id", tid)
-                if not upd: raise Full()
-                pts = await con.fetchval("UPDATE users SET points=points+$2, tasks_done=tasks_done+1 WHERE id=$1 RETURNING points", uid, task["reward"])
-    except Full:
-        await c.answer(t(lang, "task_full"), show_alert=True)
-        return await show_task(c, lang)
-    await c.answer(t(lang, "done_ok", n=task["reward"], points=pts))
+    await c.answer(t(lang, "done_ok", n=r["reward"], points=r["points"]))
     await show_task(c, lang)
 
 # ─────────────────────────── 2) Get followers (بدون حد أدنى) ───────────────────────────
@@ -388,7 +390,7 @@ async def order_target(m: Message, state: FSMContext, lang: str):
 async def order_qty(m: Message, state: FSMContext, lang: str):
     try:
         qty = int(m.text)
-        if qty < 1: raise ValueError
+        if qty < 1 or qty > MAX_ORDER: raise ValueError
     except ValueError:
         return await m.answer("❌ Please send a valid number (1 or more).\nأرسل رقماً صحيحاً (1 أو أكثر).")
         
@@ -543,7 +545,8 @@ def admin_kb():
         [("💰 إضافة رصيد", "adm:bal")],
         [("➕ مهمة: قناة", "adm:task:channel"), ("➕ مهمة: بوت", "adm:task:bot")],
         [("🔒 إجباري: قناة", "adm:mand:channel"), ("🔒 إجباري: بوت", "adm:mand:bot")],
-        [("🗂 إدارة المهام", "adm:tl")],
+        [("🗂 إدارة المهام", "adm:tl"), ("📺 الإعلانات", "adm:ads")],
+        [("📣 إذاعة", "adm:bc")],
         [("🚫 حظر", "adm:ban"), ("✅ فك الحظر", "adm:unban")],
         [("⬅️ رجوع", "menu")])
 
@@ -670,102 +673,240 @@ async def adm_tasks(c: CallbackQuery):
     await show(c, "🗂 <b>المهام الفعالة</b> (🔒 إجباري / 🎯 عادي)\n\n" + "\n".join(lines), kb(*grid))
     await c.answer()
 
-# ─────────────────── خدمة الـ Mini App (Web Server) ───────────────────
-async def web_app_handler(request):
-    # هذه الصفحة يتم عرضها داخل تيليجرام
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Mini App</title>
-        <script src="https://telegram.org/js/telegram-web-app.js"></script>
-        <style>
-            body { font-family: sans-serif; background: #17212b; color: white; text-align: center; padding: 20px; }
-            .card { background: #242f3d; padding: 20px; border-radius: 15px; margin-bottom: 15px; }
-            button { background: #2ea6ff; color: white; border: none; padding: 10px 20px; border-radius: 10px; font-size: 16px; width: 100%; margin-top: 10px;}
-        </style>
-    </head>
-    <body>
-        <h2>🚀 Welcome to Mini App</h2>
-        <div class="card">
-            <h3>Your Balance</h3>
-            <p id="balance">Loading...</p>
-            <button onclick="claimDaily()">🎁 Claim Daily Bonus</button>
-        </div>
-        <div class="card">
-            <h3>Tasks</h3>
-            <p>Available tasks will appear here soon.</p>
-        </div>
-        <script>
-            const tg = window.Telegram.WebApp;
-            tg.expand(); // جعل الشاشة كاملة
-            
-            // يمكنك هنا جلب الرصيد من الـ API الخاص بك (سنضيفه لاحقاً)
-            document.getElementById('balance').innerText = "500 Points";
-            
-            function claimDaily() {
-                tg.showAlert("Daily bonus claimed! (Demo)");
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return web.Response(text=html_content, content_type='text/html')
+# ─────────────────────── المنطق المشترك (البوت + الميني اب) ───────────────────────
+def utcnow(): return datetime.datetime.now(datetime.timezone.utc)
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_get('/', web_app_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # Railway يستخدم متغير PORT تلقائياً
-    port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    logging.info(f"Web server started on port {port}")
+def xp_of(u) -> int:
+    return (u["tasks_done"] or 0) * 2 + (u["referrals"] or 0) * 10 + (u["ads_watched"] or 0) + (u["streak"] or 0) * 2
+
+def level_info(xp: int) -> dict:
+    idx = max(i for i, l in enumerate(LEVELS) if xp >= l[0])
+    nxt = LEVELS[idx + 1][0] if idx + 1 < len(LEVELS) else None
+    return {"idx": idx, "icon": LEVELS[idx][1], "name": LEVELS[idx][2], "bonus": LEVELS[idx][3],
+            "xp": xp, "from": LEVELS[idx][0], "next": nxt}
+
+async def complete_task(uid: int, tid: int) -> dict:
+    task = await db.fetchrow("SELECT * FROM tasks WHERE id=$1", tid)
+    if not task or not task["active"] or task["mandatory"] or task["owner"] == uid:
+        return {"code": "gone"}
+    if task["type"] == "channel":
+        if not await is_member(task["target"], uid): return {"code": "not_joined"}
+    else:
+        left = BOT_WAIT_SECONDS - (time.time() - VIEWED.get((uid, tid), 0))
+        if left > 0: return {"code": "wait", "left": int(left) + 1}
+    async with db.acquire() as con:
+        async with con.transaction():
+            ins = await con.fetchval("INSERT INTO completions VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING 1", tid, uid)
+            if not ins: return {"code": "already"}
+            upd = await con.fetchval("UPDATE tasks SET done=done+1, active=(done+1<total) WHERE id=$1 AND done<total RETURNING id", tid)
+            if not upd:
+                await con.execute("DELETE FROM completions WHERE task_id=$1 AND user_id=$2", tid, uid)
+                return {"code": "full"}
+            pts = await con.fetchval("UPDATE users SET points=points+$2, tasks_done=tasks_done+1 WHERE id=$1 RETURNING points", uid, task["reward"])
+    VIEWED.pop((uid, tid), None)
+    return {"code": "ok", "reward": task["reward"], "points": pts}
+
+async def claim_daily(uid: int) -> dict:
+    async with db.acquire() as con:
+        async with con.transaction():
+            u = await con.fetchrow("SELECT last_daily, streak, tasks_done, referrals, ads_watched FROM users WHERE id=$1 FOR UPDATE", uid)
+            now = utcnow()
+            streak = 1
+            if u["last_daily"]:
+                el = (now - u["last_daily"]).total_seconds()
+                if el < 86400: return {"ok": False, "wait": int(86400 - el)}
+                if el < 172800: streak = (u["streak"] or 0) + 1
+            base = DAILY_BASE + (min(streak, DAILY_MAX_STREAK) - 1) * DAILY_STEP
+            lv = level_info(xp_of({**dict(u), "streak": streak}))
+            reward = max(1, round(base * (1 + lv["bonus"] / 100)))
+            pts = await con.fetchval("UPDATE users SET points=points+$1, last_daily=$2, streak=$3 WHERE id=$4 RETURNING points",
+                                     reward, now, streak, uid)
+    return {"ok": True, "reward": reward, "streak": streak, "points": pts, "bonus": lv["bonus"]}
+
+def spin_state(u) -> dict:
+    """جاهزية العجلة: لفة مجانية كل 24 ساعة + لفات إضافية (من الدعوات)."""
+    wait = 0
+    if u["last_spin"]:
+        wait = max(0, int(86400 - (utcnow() - u["last_spin"]).total_seconds()))
+    return {"free": wait == 0, "wait": wait, "extra": u["spins"] or 0}
+
+async def spin_wheel(uid: int) -> dict:
+    async with db.acquire() as con:
+        async with con.transaction():
+            u = await con.fetchrow("SELECT last_spin, spins FROM users WHERE id=$1 FOR UPDATE", uid)
+            st = spin_state(u)
+            if st["free"]: await con.execute("UPDATE users SET last_spin=now() WHERE id=$1", uid)
+            elif st["extra"] > 0: await con.execute("UPDATE users SET spins=spins-1 WHERE id=$1", uid)
+            else: return {"ok": False, "wait": st["wait"]}
+            idx = random.choices(range(len(WHEEL)), weights=[w for _, w in WHEEL])[0]
+            prize = WHEEL[idx][0]
+            pts = await con.fetchval("UPDATE users SET points=points+$2 WHERE id=$1 RETURNING points", uid, prize)
+            u2 = await con.fetchrow("SELECT last_spin, spins FROM users WHERE id=$1", uid)
+    return {"ok": True, "index": idx, "prize": prize, "points": pts, "spin": spin_state(u2)}
+
+async def weekly_top(limit=10):
+    return await db.fetch("""SELECT r.id, COALESCE(r.first_name, r.username) AS name, count(*)::int AS n
+        FROM users u JOIN users r ON u.referred_by = r.id
+        WHERE u.joined >= date_trunc('week', now())
+        GROUP BY r.id, r.first_name, r.username ORDER BY n DESC, r.id LIMIT $1""", limit)
+
+async def alltime_top(limit=10):
+    return await db.fetch("""SELECT id, COALESCE(first_name, username) AS name, referrals AS n
+        FROM users WHERE referrals > 0 AND NOT banned ORDER BY referrals DESC, id LIMIT $1""", limit)
+
+async def create_order(uid: int, kind: str, raw: str, qty: int) -> dict:
+    if kind not in ("channel", "bot"): return {"error": "bad_target"}
+    if qty < 1 or qty > MAX_ORDER: return {"error": "bad_qty"}
+    target = parse_target(raw, kind)
+    if not target: return {"error": "bad_target"}
+    if kind == "channel" and not await bot_is_admin(target): return {"error": "not_admin"}
+    cost = qty * COST_PER_MEMBER
+    async with db.acquire() as con:
+        async with con.transaction():
+            left = await con.fetchval("UPDATE users SET points=points-$1 WHERE id=$2 AND points>=$1 RETURNING points", cost, uid)
+            if left is None: return {"error": "no_points", "need": cost}
+            await con.execute("INSERT INTO tasks(owner,type,target,reward,total) VALUES($1,$2,$3,$4,$5)", uid, kind, target, TASK_REWARD, qty)
+    return {"ok": True, "points": left, "cost": cost, "target": display(target)}
+
+# ── الإعلانات ──
+async def ad_next(uid: int) -> dict:
+    """يرجع إعلاناً إذا حان وقته، أو مدة الانتظار، أو placeholder إذا لا توجد إعلانات."""
+    ads = await db.fetch("SELECT id, title, url, reward FROM ads WHERE active")
+    if not ads: return {"ad": None, "placeholder": True}
+    last = await db.fetchval("SELECT started FROM ad_views WHERE user_id=$1 ORDER BY started DESC LIMIT 1", uid)
+    if last:
+        wait = int(AD_INTERVAL - (utcnow() - last).total_seconds())
+        if wait > 0: return {"ad": None, "wait": wait}
+    today = await db.fetchval("SELECT count(*) FROM ad_views WHERE user_id=$1 AND claimed AND started >= date_trunc('day', now())", uid)
+    if today >= AD_DAILY_LIMIT: return {"ad": None, "limit": True}
+    seen = {r["ad_id"] for r in await db.fetch("SELECT DISTINCT ad_id FROM ad_views WHERE user_id=$1 AND started >= now()-interval '1 day'", uid)}
+    pool = [a for a in ads if a["id"] not in seen] or ads
+    a = random.choice(pool)
+    return {"ad": {"id": a["id"], "title": a["title"], "reward": a["reward"]}, "watch": AD_WATCH_SECONDS}
+
+async def ad_start(uid: int, ad_id: int) -> dict:
+    r = await ad_next(uid)
+    if not r.get("ad"): return {"error": "ad_wait", "wait": r.get("wait", 0)}
+    ad = await db.fetchrow("SELECT * FROM ads WHERE id=$1 AND active", ad_id)
+    if not ad: return {"error": "ad_gone"}
+    vid = await db.fetchval("INSERT INTO ad_views(user_id, ad_id) VALUES($1,$2) RETURNING id", uid, ad_id)
+    return {"view": vid, "url": ad["url"], "watch": AD_WATCH_SECONDS, "reward": ad["reward"]}
+
+async def ad_claim(uid: int, vid: int) -> dict:
+    async with db.acquire() as con:
+        async with con.transaction():
+            v = await con.fetchrow("SELECT * FROM ad_views WHERE id=$1 AND user_id=$2 FOR UPDATE", vid, uid)
+            if not v or v["claimed"]: return {"error": "ad_gone"}
+            left = AD_WATCH_SECONDS - (utcnow() - v["started"]).total_seconds()
+            if left > 1: return {"error": "ad_early", "left": int(left) + 1}
+            ad = await con.fetchrow("SELECT reward FROM ads WHERE id=$1", v["ad_id"])
+            reward = ad["reward"] if ad else AD_DEFAULT_REWARD
+            await con.execute("UPDATE ad_views SET claimed=TRUE WHERE id=$1", vid)
+            await con.execute("UPDATE ads SET views=views+1 WHERE id=$1", v["ad_id"])
+            pts = await con.fetchval("UPDATE users SET points=points+$2, ads_watched=ads_watched+1 WHERE id=$1 RETURNING points", uid, reward)
+    return {"ok": True, "reward": reward, "points": pts}
+
+# ─────────────────────── إدارة الإعلانات والإذاعة (أدمن) ───────────────────────
+class AdmAd(StatesGroup):
+    new = State()
+
+class AdmBc(StatesGroup):
+    text = State()
+
+@admin_r.callback_query(F.data.regexp(r"^adm:(ads|adt:\d+|add:\d+)$"))
+async def adm_ads(c: CallbackQuery):
+    parts = c.data.split(":")
+    if parts[1] == "adt":
+        await db.execute("UPDATE ads SET active = NOT active WHERE id=$1", int(parts[2]))
+    elif parts[1] == "add":
+        await db.execute("DELETE FROM ads WHERE id=$1", int(parts[2]))
+    rows = await db.fetch("SELECT * FROM ads ORDER BY id DESC LIMIT 20")
+    lines = [f"#{r['id']} {'🟢' if r['active'] else '⚪️'} {html.escape(r['title'] or '')} — {r['reward']}⭐ — 👁 {r['views']}" for r in rows]
+    txt = (f"📺 <b>الإعلانات</b>\n\nيظهر إعلان لكل مستخدم كل {AD_INTERVAL // 60} دقيقة، ويشاهده {AD_WATCH_SECONDS} ثانية ليحصل على نقاطه.\n"
+           "إذا لم توجد إعلانات فعالة يظهر مكانها «مساحة إعلانية».\n\n" + ("\n".join(lines) if lines else "لا توجد إعلانات بعد."))
+    btns = []
+    for r in rows: btns.append([(f"{'⏸' if r['active'] else '▶️'} #{r['id']}", f"adm:adt:{r['id']}"), (f"🗑 #{r['id']}", f"adm:add:{r['id']}")])
+    await show(c, txt, kb([("➕ إضافة إعلان", "adm:adn")], *btns, [("⬅️ رجوع", "admin")]))
+    await c.answer()
+
+@admin_r.callback_query(F.data == "adm:adn")
+async def adm_ad_new(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdmAd.new)
+    await c.message.answer("📺 أرسل الإعلان بهذه الصيغة (سطر واحد):\n<code>العنوان | الرابط | النقاط</code>\n"
+                           "مثال: <code>قناة أخبار التقنية | https://t.me/mychannel | 2</code>\n\n/cancel للإلغاء")
+    await c.answer()
+
+@admin_r.message(AdmAd.new, F.text, ~F.text.startswith("/"))
+async def adm_ad_save(m: Message, state: FSMContext):
+    parts = [x.strip() for x in m.text.split("|")]
+    try:
+        title, url = parts[0], parts[1]
+        reward = int(parts[2]) if len(parts) > 2 else AD_DEFAULT_REWARD
+        assert title and url.startswith("http") and reward >= 0
+    except (IndexError, ValueError, AssertionError):
+        return await m.answer("❌ صيغة خاطئة. مثال: <code>العنوان | https://رابط | 2</code>")
+    await db.execute("INSERT INTO ads(title,url,reward) VALUES($1,$2,$3)", title[:100], url, reward)
+    await state.clear()
+    await m.answer("✅ تمت إضافة الإعلان.", reply_markup=kb([("📺 الإعلانات", "adm:ads")]))
+
+@admin_r.callback_query(F.data == "adm:bc")
+async def adm_bc_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdmBc.text)
+    await c.message.answer("📣 أرسل نص الإذاعة (HTML مسموح) وسيصل لكل المستخدمين غير المحظورين.\n/cancel للإلغاء")
+    await c.answer()
+
+@admin_r.message(AdmBc.text, F.text, ~F.text.startswith("/"))
+async def adm_bc_send(m: Message, state: FSMContext):
+    await state.clear()
+    ids = [r["id"] for r in await db.fetch("SELECT id FROM users WHERE NOT banned")]
+    await m.answer(f"⏳ جاري الإرسال إلى {len(ids)} مستخدم...")
+    asyncio.create_task(broadcast(m.from_user.id, m.text, ids))
+
+async def broadcast(admin_id, text, ids):
+    ok = fail = 0
+    for uid in ids:
+        try: await bot.send_message(uid, text); ok += 1
+        except Exception: fail += 1
+        await asyncio.sleep(0.05)
+    try: await bot.send_message(admin_id, f"📣 اكتملت الإذاعة\n✅ {ok}  ❌ {fail}")
+    except Exception: pass
 
 # ─────────────────── المهام الخلفية (التحقق والإشعارات) ───────────────────
 async def background_worker():
+    last_check = 0
     while True:
         try:
-            # 1. التحقق من بقاء المشتركين (كل 24 ساعة)
-            # هنا نأخذ عينة من المهام المكتملة ونتأكد أن المستخدم ما زال مشتركاً
-            rows = await db.fetch("""
-                SELECT c.user_id, t.target, t.reward, u.points 
-                FROM completions c 
-                JOIN tasks t ON c.task_id = t.id 
-                JOIN users u ON c.user_id = u.id 
-                WHERE t.type = 'channel' AND t.active = TRUE
-                ORDER BY random() LIMIT 20
-            """)
-            for r in rows:
-                is_mem = await is_member(r['target'], r['user_id'])
-                if not is_mem:
-                    # خصم النقاط
-                    await db.execute("UPDATE users SET points = GREATEST(points - $1, 0) WHERE id = $2", r['reward'], r['user_id'])
-                    try:
-                        ul = await db.fetchval("SELECT lang FROM users WHERE id=$1", r['user_id'])
-                        await bot.send_message(r['user_id'], f"⚠️ We noticed you left {display(r['target'])}. Points deducted.")
-                    except: pass
-                await asyncio.sleep(1) # تجنب الحظر من تيليجرام
-                
-            # 2. إشعار المستخدمين الخاملين (كل 48 ساعة)
-            inactive_users = await db.fetch("""
-                SELECT id, lang FROM users 
-                WHERE last_active < now() - interval '2 days' 
-                AND last_active > now() - interval '3 days'
-            """)
-            for u in inactive_users:
-                try:
-                    await bot.send_message(u['id'], "👋 We miss you! New tasks are available. Come back and earn points!")
-                except: pass
-                await asyncio.sleep(1)
-                
+            # تنظيف الذاكرة
+            now = time.time()
+            for k in [k for k, v in VIEWED.items() if now - v > 3600]: VIEWED.pop(k, None)
+            await db.execute("DELETE FROM ad_views WHERE started < now() - interval '7 days'")
+
+            if now - last_check > 86400 or last_check == 0:
+                last_check = now
+                # 1) من غادر القناة بعد إكمال المهمة: خصم النقاط مرة واحدة فقط
+                rows = await db.fetch("""
+                    SELECT c.task_id, c.user_id, t.target, t.reward FROM completions c
+                    JOIN tasks t ON c.task_id = t.id
+                    WHERE t.type='channel' AND t.owner IS NOT NULL AND t.reward > 0
+                    ORDER BY random() LIMIT 40""")
+                for r in rows:
+                    st = await member_state(r["target"], r["user_id"])
+                    if st is False:  # None = تعذر التحقق → لا عقوبة
+                        await db.execute("UPDATE users SET points = GREATEST(points - $1, 0) WHERE id = $2", r["reward"], r["user_id"])
+                        await db.execute("DELETE FROM completions WHERE task_id=$1 AND user_id=$2", r["task_id"], r["user_id"])
+                        ul = await db.fetchval("SELECT lang FROM users WHERE id=$1", r["user_id"])
+                        try: await bot.send_message(r["user_id"], t(ul, "left_penalty", target=display(r["target"]), n=r["reward"]))
+                        except Exception: pass
+                    await asyncio.sleep(1)
+                # 2) تذكير الخاملين (مرة لكل فترة خمول)
+                for u in await db.fetch("""SELECT id, lang FROM users WHERE NOT banned
+                        AND last_active < now() - interval '2 days' AND last_active > now() - interval '3 days'"""):
+                    try: await bot.send_message(u["id"], t(u["lang"], "miss_you"))
+                    except Exception: pass
+                    await asyncio.sleep(0.1)
         except Exception as e:
-            logging.error(f"Background worker error: {e}")
-            
-        await asyncio.sleep(86400) # ينام لمدة يوم
+            logging.error("Background worker error: %s", e)
+        await asyncio.sleep(3600)
 
 # ───────────────────────────────── Run ─────────────────────────────────
 async def main():
@@ -776,10 +917,13 @@ async def main():
     me = await bot.get_me()
     BOT_ID, BOT_USERNAME = me.id, me.username
     
-    # تشغيل سيرفر الويب للميني أب
-    asyncio.create_task(start_web_server())
-    # تشغيل المهام الخلفية
-    asyncio.create_task(background_worker())
+    # سيرفر الميني اب (API + الواجهة)
+    import webapp
+    await webapp.start(sys.modules[__name__])
+    if WEBAPP_URL.startswith("https://"):
+        try: await bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🚀 Mini App", web_app=WebAppInfo(url=WEBAPP_URL)))
+        except Exception as e: logging.warning("menu button: %s", e)
+    BG.append(asyncio.create_task(background_worker()))
     
     dp = Dispatcher(storage=MemoryStorage())
     dp.message.outer_middleware(UserMW())
