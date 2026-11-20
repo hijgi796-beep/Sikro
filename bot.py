@@ -437,4 +437,356 @@ async def buy_photo(m: Message, state: FSMContext, lang: str):
                f"🛒 مرات الشحن السابقة: {u['purchases']}\n💰 رصيده الحالي: {u['points']}\n"
                f"📅 انضم: {u['joined']:%Y-%m-%d}")
     await notify_admins(caption, kb([("✅ موافقة", f"pok:{pid}"), ("❌ رفض", f"pno:{pid}")]), photo=m.photo[-1].file_id)
-    await m.answer(t
+    await m.answer(t(lang, "buy_got"), reply_markup=kb([(t(lang, "b_back"), "menu")]))
+
+@user_r.message(Buy.shot)
+async def buy_nophoto(m: Message, lang: str):
+    await m.answer(t(lang, "buy_photo"))
+
+@admin_r.callback_query(F.data.startswith(("pok:", "pno:")))
+async def pay_decide(c: CallbackQuery):
+    action, pid = c.data.split(":")
+    pid = int(pid)
+    status = "approved" if action == "pok" else "rejected"
+    p = await db.fetchrow("UPDATE payments SET status=$2 WHERE id=$1 AND status='pending' RETURNING *", pid, status)
+    if not p: return await c.answer("تمت معالجة هذا الطلب مسبقاً", show_alert=True)
+    ul = await db.fetchval("SELECT lang FROM users WHERE id=$1", p["user_id"])
+    if status == "approved":
+        await db.execute("UPDATE users SET points=points+$2, purchases=purchases+1 WHERE id=$1", p["user_id"], p["points"])
+        msg = t(ul, "pay_ok", pts=p["points"])
+    else: msg = t(ul, "pay_no")
+    try: await bot.send_message(p["user_id"], msg)
+    except Exception: pass
+    label = "✅ تمت الموافقة" if status == "approved" else "❌ تم الرفض"
+    try: await c.message.edit_caption(caption=(c.message.caption or "") + f"\n\n{label} بواسطة {c.from_user.id}")
+    except TelegramBadRequest: pass
+    await c.answer(label)
+
+# ─────────────────────────── 4) Support ───────────────────────────
+@user_r.callback_query(F.data == "support")
+async def cb_support(c: CallbackQuery, lang: str, state: FSMContext):
+    await state.set_state(Support.text)
+    await show(c, t(lang, "sup_prompt"))
+    await c.answer()
+
+@user_r.message(Support.text, F.text)
+async def support_msg(m: Message, state: FSMContext, lang: str):
+    await state.clear()
+    tid = await db.fetchval("INSERT INTO tickets(user_id,text) VALUES($1,$2) RETURNING id", m.from_user.id, m.text)
+    await notify_admins(
+        f"🆘 <b>تذكرة دعم #{tid}</b>\n🆔 <code>{m.from_user.id}</code> @{html.escape(m.from_user.username or '-')}\n\n{html.escape(m.text)}",
+        kb([("💬 رد", f"tk:{tid}")]))
+    await m.answer(t(lang, "sup_sent"), reply_markup=kb([(t(lang, "b_back"), "menu")]))
+
+@admin_r.callback_query(F.data.startswith("tk:"))
+async def ticket_reply_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(Adm.reply)
+    await state.update_data(tid=int(c.data.split(":")[1]))
+    await c.message.answer("✍️ اكتب ردك الآن (أو /cancel):")
+    await c.answer()
+
+@admin_r.message(Adm.reply, F.text, ~F.text.startswith("/"))
+async def ticket_reply_send(m: Message, state: FSMContext):
+    tid = (await state.get_data())["tid"]
+    await state.clear()
+    row = await db.fetchrow("UPDATE tickets SET status='closed' WHERE id=$1 RETURNING user_id", tid)
+    if not row: return await m.answer("التذكرة غير موجودة")
+    ul = await db.fetchval("SELECT lang FROM users WHERE id=$1", row["user_id"])
+    try:
+        await bot.send_message(row["user_id"], t(ul, "sup_reply", text=html.escape(m.text)))
+        await m.answer("✅ تم إرسال الرد")
+    except Exception: await m.answer("⚠️ تعذر الإرسال (ربما حظر المستخدم البوت)")
+
+# ─────────────────── Account / Invite / Settings ───────────────────
+@user_r.callback_query(F.data == "account")
+async def cb_account(c: CallbackQuery, lang: str):
+    u = await db.fetchrow("SELECT * FROM users WHERE id=$1", c.from_user.id)
+    await show(c, t(lang, "account", id=u["id"], username="@" + u["username"] if u["username"] else "-",
+                    points=u["points"], refs=u["referrals"], tasks=u["tasks_done"], buys=u["purchases"],
+                    lang=LANGS.get(u["lang"], u["lang"]), joined=f"{u['joined']:%Y-%m-%d}"),
+               kb([(t(lang, "b_back"), "menu")]))
+    await c.answer()
+
+@user_r.callback_query(F.data == "invite")
+async def cb_invite(c: CallbackQuery, lang: str):
+    refs = await db.fetchval("SELECT referrals FROM users WHERE id=$1", c.from_user.id)
+    await show(c, t(lang, "invite", bonus=REF_BONUS, refs=refs,
+                    link=f"https://t.me/{BOT_USERNAME}?start=ref_{c.from_user.id}"),
+               kb([(t(lang, "b_back"), "menu")]))
+    await c.answer()
+
+@user_r.callback_query(F.data == "settings")
+async def cb_settings(c: CallbackQuery, lang: str):
+    codes = list(LANGS)
+    rows = [[(LANGS[x], f"sl:{x}") for x in codes[i:i + 3]] for i in range(0, len(codes), 3)]
+    rows.append([(t(lang, "b_back"), "menu")])
+    await show(c, t(lang, "settings"), kb(*rows))
+    await c.answer()
+
+@user_r.callback_query(F.data.startswith("sl:"))
+async def cb_setlang(c: CallbackQuery):
+    code = c.data.split(":")[1]
+    if code in LANGS:
+        await db.execute("UPDATE users SET lang=$1 WHERE id=$2", code, c.from_user.id)
+        await c.answer(t(code, "lang_ok"))
+        await send_menu(c, code)
+
+# ───────────────────────────── 5) Admin panel ─────────────────────────────
+class AdmTask(StatesGroup):
+    link = State()
+    descr = State()
+    nums = State()
+
+def admin_kb():
+    return kb(
+        [("📊 الإحصائيات", "adm:stats"), ("👥 الدعوات", "adm:ref")],
+        [("💰 إضافة رصيد", "adm:bal")],
+        [("➕ مهمة: قناة", "adm:task:channel"), ("➕ مهمة: بوت", "adm:task:bot")],
+        [("🔒 إجباري: قناة", "adm:mand:channel"), ("🔒 إجباري: بوت", "adm:mand:bot")],
+        [("🗂 إدارة المهام", "adm:tl")],
+        [("🚫 حظر", "adm:ban"), ("✅ فك الحظر", "adm:unban")],
+        [("⬅️ رجوع", "menu")])
+
+@admin_r.callback_query(F.data == "admin")
+async def cb_admin(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show(c, "🛠 <b>لوحة الأدمن</b>", admin_kb())
+    await c.answer()
+
+@admin_r.callback_query(F.data == "adm:stats")
+async def adm_stats(c: CallbackQuery):
+    q = lambda w: db.fetchval(f"SELECT count(*) FROM users WHERE {w}")
+    now = await q("last_active > now()-interval '5 minutes'")
+    hour = await q("last_active > now()-interval '1 hour'")
+    day = await q("last_active > now()-interval '1 day'")
+    total = await q("TRUE")
+    pending = await db.fetchval("SELECT count(*) FROM payments WHERE status='pending'")
+    await show(c, f"📊 <b>المستخدمون النشطون</b>\n\n🟢 الآن (5 د): {now}\n🕐 آخر ساعة: {hour}\n📅 آخر 24 ساعة: {day}\n👥 الإجمالي: {total}\n\n⏳ دفعات معلقة: {pending}",
+               kb([("⬅️ رجوع", "admin")]))
+    await c.answer()
+
+@admin_r.callback_query(F.data == "adm:ref")
+async def adm_ref(c: CallbackQuery):
+    today = await db.fetchval("SELECT count(*) FROM users WHERE referred_by IS NOT NULL AND joined >= date_trunc('day', now())")
+    total = await db.fetchval("SELECT count(*) FROM users WHERE referred_by IS NOT NULL")
+    await show(c, f"👥 <b>الدعوات</b>\n\nاليوم: {today}\nالإجمالي: {total}", kb([("⬅️ رجوع", "admin")]))
+    await c.answer()
+
+PROMPTS = {
+    "bal": "💰 أرسل: <code>ID المبلغ</code>\nمثال: <code>123456789 50</code> (سالب للخصم)",
+    "ban": "🚫 أرسل ID المستخدم لحظره",
+    "unban": "✅ أرسل ID المستخدم لفك الحظر",
+}
+
+@admin_r.callback_query(F.data.regexp(r"^adm:(bal|ban|unban)$"))
+async def adm_prompt(c: CallbackQuery, state: FSMContext):
+    action = c.data.split(":")[1]
+    await state.set_state(Adm.input)
+    await state.update_data(action=action)
+    await c.message.answer(PROMPTS[action] + "\n\n/cancel للإلغاء")
+    await c.answer()
+
+@admin_r.message(Adm.input, F.text, ~F.text.startswith("/"))
+async def adm_input(m: Message, state: FSMContext):
+    a, p = (await state.get_data())["action"], m.text.split()
+    try:
+        if a == "bal":
+            uid, amt = int(p[0]), int(p[1])
+            pts = await db.fetchval("UPDATE users SET points=points+$2 WHERE id=$1 RETURNING points", uid, amt)
+            res = f"✅ الرصيد الجديد: {pts}" if pts is not None else "❌ المستخدم غير موجود"
+        else:
+            uid = int(p[0])
+            ok = await db.fetchval("UPDATE users SET banned=$2 WHERE id=$1 RETURNING id", uid, a == "ban")
+            res = ("✅ تم الحظر" if a == "ban" else "✅ تم فك الحظر") if ok else "❌ المستخدم غير موجود"
+    except (ValueError, IndexError):
+        return await m.answer("❌ صيغة خاطئة، أعد المحاولة أو /cancel")
+    await state.clear()
+    await m.answer(res, reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+
+# ── Add task (normal or mandatory): link → campaign name → reward/count ──
+@admin_r.callback_query(F.data.regexp(r"^adm:(task|mand):(channel|bot)$"))
+async def adm_task_start(c: CallbackQuery, state: FSMContext):
+    _, mode, kind = c.data.split(":")
+    await state.set_state(AdmTask.link)
+    await state.update_data(mode=mode, kind=kind)
+    if kind == "bot": txt = "🔗 أرسل رابط الإحالة الخاص بالبوت\nمثال: <code>https://t.me/mybot?start=123456</code>"
+    else: txt = "📢 أرسل معرف القناة\nمثال: <code>@mychannel</code>\n(لازم يكون البوت أدمن فيها ليتحقق من الاشتراك)"
+    if mode == "mand": txt = "🔒 <b>مهمة إجبارية</b> (كل مستخدم لازم يكملها ليستعمل البوت)\n\n" + txt
+    await c.message.answer(txt + "\n\n/cancel للإلغاء")
+    await c.answer()
+
+@admin_r.message(AdmTask.link, F.text, ~F.text.startswith("/"))
+async def adm_task_link(m: Message, state: FSMContext):
+    d = await state.get_data()
+    target = parse_target(m.text, d["kind"])
+    if not target: return await m.answer("❌ رابط/معرف غير صالح، أعد المحاولة أو /cancel")
+    if d["kind"] == "channel" and not await bot_is_admin(target): return await m.answer("❌ أضف البوت أدمن في القناة أولاً ثم أرسل المعرف مرة أخرى")
+    await state.update_data(target=target)
+    await state.set_state(AdmTask.descr)
+    await m.answer("📝 أرسل اسم الحملة أو وصفها (يظهر للمستخدم)\nمثال: <code>إرسال /start للبوت والبقاء فيه 10 ثواني</code>")
+
+@admin_r.message(AdmTask.descr, F.text, ~F.text.startswith("/"))
+async def adm_task_descr(m: Message, state: FSMContext):
+    d = await state.get_data()
+    descr = m.text.strip()[:300]
+    if d["mode"] == "mand":
+        await db.execute("INSERT INTO tasks(owner,type,target,reward,total,descr,mandatory) VALUES(NULL,$1,$2,0,1000000000,$3,TRUE)",
+                         d["kind"], d["target"], descr)
+        await state.clear()
+        return await m.answer(f"✅ تمت إضافة مهمة إجبارية: {display(d['target'])}\nكل المستخدمين (القدامى والجدد) لازم يكملونها.",
+                              reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+    await state.update_data(descr=descr)
+    await state.set_state(AdmTask.nums)
+    await m.answer("🎁 أرسل: <code>المكافأة العدد</code>\nمثال: <code>1 100</code>\n(المكافأة بالنقاط لكل مستخدم، والعدد = كم مستخدم يقدر ينفذها)")
+
+@admin_r.message(AdmTask.nums, F.text, ~F.text.startswith("/"))
+async def adm_task_nums(m: Message, state: FSMContext):
+    d = await state.get_data()
+    try:
+        reward, count = (int(x) for x in m.text.split()[:2])
+        assert reward >= 0 and count > 0
+    except (ValueError, AssertionError):
+        return await m.answer("❌ صيغة خاطئة، مثال: <code>1 100</code>")
+    await db.execute("INSERT INTO tasks(owner,type,target,reward,total,descr,mandatory) VALUES(NULL,$1,$2,$3,$4,$5,FALSE)",
+                     d["kind"], d["target"], reward, count, d["descr"])
+    await state.clear()
+    await m.answer(f"✅ تمت إضافة المهمة: {display(d['target'])} | {reward} نقطة | {count} مرة",
+                   reply_markup=kb([("⬅️ لوحة الأدمن", "admin")]))
+
+# ── Manage tasks ──
+@admin_r.callback_query(F.data.regexp(r"^adm:(tl|td:\d+)$"))
+async def adm_tasks(c: CallbackQuery):
+    parts = c.data.split(":")
+    if parts[1] == "td":
+        await db.execute("UPDATE tasks SET active=FALSE WHERE id=$1 AND owner IS NULL", int(parts[2]))
+    rows = await db.fetch("SELECT * FROM tasks WHERE active AND owner IS NULL ORDER BY id DESC LIMIT 20")
+    if not rows:
+        await show(c, "🗂 لا توجد مهام فعالة", kb([("⬅️ رجوع", "admin")]))
+        return await c.answer()
+    lines = [f"#{r['id']} {'🔒' if r['mandatory'] else '🎯'} {r['type']} {display(r['target'])} — "
+             f"{r['done']}/{'∞' if r['mandatory'] else r['total']}" for r in rows]
+    btns = [(f"🗑 #{r['id']}", f"adm:td:{r['id']}") for r in rows]
+    grid = [btns[i:i + 3] for i in range(0, len(btns), 3)] + [[("⬅️ رجوع", "admin")]]
+    await show(c, "🗂 <b>المهام الفعالة</b> (🔒 إجباري / 🎯 عادي)\n\n" + "\n".join(lines), kb(*grid))
+    await c.answer()
+
+# ─────────────────── خدمة الـ Mini App (Web Server) ───────────────────
+async def web_app_handler(request):
+    # هذه الصفحة يتم عرضها داخل تيليجرام
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Mini App</title>
+        <script src="https://telegram.org/js/telegram-web-app.js"></script>
+        <style>
+            body { font-family: sans-serif; background: #17212b; color: white; text-align: center; padding: 20px; }
+            .card { background: #242f3d; padding: 20px; border-radius: 15px; margin-bottom: 15px; }
+            button { background: #2ea6ff; color: white; border: none; padding: 10px 20px; border-radius: 10px; font-size: 16px; width: 100%; margin-top: 10px;}
+        </style>
+    </head>
+    <body>
+        <h2>🚀 Welcome to Mini App</h2>
+        <div class="card">
+            <h3>Your Balance</h3>
+            <p id="balance">Loading...</p>
+            <button onclick="claimDaily()">🎁 Claim Daily Bonus</button>
+        </div>
+        <div class="card">
+            <h3>Tasks</h3>
+            <p>Available tasks will appear here soon.</p>
+        </div>
+        <script>
+            const tg = window.Telegram.WebApp;
+            tg.expand(); // جعل الشاشة كاملة
+            
+            // يمكنك هنا جلب الرصيد من الـ API الخاص بك (سنضيفه لاحقاً)
+            document.getElementById('balance').innerText = "500 Points";
+            
+            function claimDaily() {
+                tg.showAlert("Daily bonus claimed! (Demo)");
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return web.Response(text=html_content, content_type='text/html')
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/', web_app_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Railway يستخدم متغير PORT تلقائياً
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    logging.info(f"Web server started on port {port}")
+
+# ─────────────────── المهام الخلفية (التحقق والإشعارات) ───────────────────
+async def background_worker():
+    while True:
+        try:
+            # 1. التحقق من بقاء المشتركين (كل 24 ساعة)
+            # هنا نأخذ عينة من المهام المكتملة ونتأكد أن المستخدم ما زال مشتركاً
+            rows = await db.fetch("""
+                SELECT c.user_id, t.target, t.reward, u.points 
+                FROM completions c 
+                JOIN tasks t ON c.task_id = t.id 
+                JOIN users u ON c.user_id = u.id 
+                WHERE t.type = 'channel' AND t.active = TRUE
+                ORDER BY random() LIMIT 20
+            """)
+            for r in rows:
+                is_mem = await is_member(r['target'], r['user_id'])
+                if not is_mem:
+                    # خصم النقاط
+                    await db.execute("UPDATE users SET points = GREATEST(points - $1, 0) WHERE id = $2", r['reward'], r['user_id'])
+                    try:
+                        ul = await db.fetchval("SELECT lang FROM users WHERE id=$1", r['user_id'])
+                        await bot.send_message(r['user_id'], f"⚠️ We noticed you left {display(r['target'])}. Points deducted.")
+                    except: pass
+                await asyncio.sleep(1) # تجنب الحظر من تيليجرام
+                
+            # 2. إشعار المستخدمين الخاملين (كل 48 ساعة)
+            inactive_users = await db.fetch("""
+                SELECT id, lang FROM users 
+                WHERE last_active < now() - interval '2 days' 
+                AND last_active > now() - interval '3 days'
+            """)
+            for u in inactive_users:
+                try:
+                    await bot.send_message(u['id'], "👋 We miss you! New tasks are available. Come back and earn points!")
+                except: pass
+                await asyncio.sleep(1)
+                
+        except Exception as e:
+            logging.error(f"Background worker error: {e}")
+            
+        await asyncio.sleep(86400) # ينام لمدة يوم
+
+# ───────────────────────────────── Run ─────────────────────────────────
+async def main():
+    global db, BOT_ID, BOT_USERNAME
+    logging.basicConfig(level=logging.INFO)
+    db = await asyncpg.create_pool(DATABASE_URL)
+    await db.execute(SCHEMA)
+    me = await bot.get_me()
+    BOT_ID, BOT_USERNAME = me.id, me.username
+    
+    # تشغيل سيرفر الويب للميني أب
+    asyncio.create_task(start_web_server())
+    # تشغيل المهام الخلفية
+    asyncio.create_task(background_worker())
+    
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(UserMW())
+    dp.callback_query.outer_middleware(UserMW())
+    dp.include_routers(admin_r, user_r)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
